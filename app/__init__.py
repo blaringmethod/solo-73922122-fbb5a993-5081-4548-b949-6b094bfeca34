@@ -138,26 +138,54 @@ def create_app(db_path: str | None = None) -> Flask:
         return redirect(url_for("rules"))
 
     # ---------------- 结果 ----------------
-    @app.route("/results")
+    @app.route("/results", methods=["GET", "POST"])
     def results():
         verdict = request.args.get("verdict") or None
         page = max(1, request.args.get("page", 1, type=int))
         conn = svc()._conn()
         try:
-            vid = svc().current_version_id(conn)
-            version = svc().get_version(conn, vid) if vid else None
+            current = svc().current_version_id(conn)
+            # 复核只针对受理时的现行版：表单里带着当时的版号，页面打开后若已发新版则拒绝。
+            version = svc().get_version(conn, current) if current else None
             if version is None:
                 return render_template("results.html", version=None, rows=[],
                                        total=0, page=1, pages=1, verdict=verdict,
-                                       verdicts=VERDICTS, verdict_labels=VERDICT_LABELS)
-            total = svc().result_count(conn, vid, verdict)
-            rows = svc().result_page(conn, vid, verdict, PAGE_SIZE, (page - 1) * PAGE_SIZE)
+                                       verdicts=VERDICTS, verdict_labels=VERDICT_LABELS,
+                                       review=None)
+
+            total = svc().result_count(conn, current, verdict)
+            rows = svc().result_page(conn, current, verdict, PAGE_SIZE,
+                                     (page - 1) * PAGE_SIZE)
             pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+            review = svc().review_page(
+                conn, current,
+                dict(request.form) if request.method == "POST" else None,
+            )
             return render_template("results.html", version=version, rows=rows,
                                    total=total, page=page, pages=pages, verdict=verdict,
-                                   verdicts=VERDICTS, verdict_labels=VERDICT_LABELS)
+                                   verdicts=VERDICTS, verdict_labels=VERDICT_LABELS,
+                                   review=review)
         finally:
             conn.close()
+
+    @app.route("/results/review/sample")
+    def review_sample():
+        """下载复核示例名单（完整卷号，CSV），供 5 万卷规模下复算。"""
+        try:
+            version_id = int(request.args.get("version_id", ""))
+            count_a = int(request.args.get("count_a", ""))
+            count_b = int(request.args.get("count_b", ""))
+            intersection = int(request.args.get("s", ""))
+        except (TypeError, ValueError):
+            flash("示例名单参数不完整。", "error")
+            return redirect(url_for("results"))
+        content = svc().review_sample_csv(version_id, count_a, count_b, intersection)
+        return send_file(
+            io.BytesIO(content.encode("utf-8")),
+            mimetype="text/csv; charset=utf-8",
+            as_attachment=True,
+            download_name=f"review_v{version_id}_s{intersection}.csv",
+        )
 
     # ---------------- 版本与下载 ----------------
     @app.route("/versions")

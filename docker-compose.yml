@@ -10,6 +10,7 @@ services:
     environment:
       CATALOG_DB: /data/catalog.db
       SECRET_KEY: demo-secret-change-me
+      DEMO_SEED: "1"
     restart: unless-stopped
 
 volumes:

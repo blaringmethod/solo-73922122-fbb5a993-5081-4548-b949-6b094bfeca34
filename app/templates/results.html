@@ -14,6 +14,77 @@
   {% endfor %}
   <a class="btn" href="{{ url_for('download', version_id=version.id, only_in=1) }}">下载本版确定入编 CSV</a>
 </div>
+
+{% if review %}
+<section class="review">
+  <h3>报数复核 <span class="hint">受理版本 #{{ version.id }}</span></h3>
+  {% if review.error %}<p class="flash error">{{ review.error }}</p>{% endif %}
+  {% if not review.eligible %}
+    {% if review.reason %}<p class="hint">未启用复核：{{ review.reason }}</p>{% endif %}
+  {% else %}
+    <p class="hint">
+      两份缺报名单：<b>{{ review.names[0] }}</b>、<b>{{ review.names[1] }}</b>。
+      填入两份名单在总册内的卷数与编目员待复核的入编数（均为 0–{{ version.total }} 的整数），
+      系统按受理版本的总册、已交名单与收录规则找出最接近且确实可达到的入编数。
+    </p>
+    <form method="post" action="{{ url_for('results') }}" class="review-form">
+      <input type="hidden" name="review" value="1">
+      <input type="hidden" name="version_id" value="{{ version.id }}">
+      <input type="hidden" name="form_version" value="{{ version.id }}">
+      <label>{{ review.names[0] }} 卷数
+        <input name="count_a" inputmode="numeric" value="{{ review.form.count_a }}" required>
+      </label>
+      <label>{{ review.names[1] }} 卷数
+        <input name="count_b" inputmode="numeric" value="{{ review.form.count_b }}" required>
+      </label>
+      <label>待复核的入编数
+        <input name="reported" inputmode="numeric" value="{{ review.form.reported }}" required>
+      </label>
+      <button class="btn primary" type="submit">复核</button>
+    </form>
+
+    {% if review.result %}
+      {% set result = review.result %}
+      <p class="hint">{{ result.formula }}；本版总册共 {{ version.total }} 卷。
+        受理版本 #{{ version.id }} 的规则、缺报名单与卷序已固化，后续补报/发版不会改变本次复核。</p>
+      {% if result.options | length > 1 %}
+        <p class="flash">填报 {{ result.reported }} 与两侧可达值等距，均列出：</p>
+      {% elif result.options[0].distance == 0 %}
+        <p class="flash ok">填报 {{ result.reported }} 确实能达到。</p>
+      {% else %}
+        <p class="flash">填报 {{ result.reported }} 不能达到；最接近的可达入编数为 {{ result.options[0].count }}
+          （相差 {{ result.options[0].distance }}）。</p>
+      {% endif %}
+      {% for opt in result.options %}
+      <div class="review-option">
+        <h4>可达入编数 {{ opt.count }}
+          <span class="hint">与填报相差 {{ opt.distance }}；交集卷数 s = {{ opt.s }}</span></h4>
+        <p class="hint">示例名单（仅用于复算，卷号取自受理版本 #{{ version.id }} 的卷序）：
+          <a href="{{ url_for('review_sample', version_id=version.id, count_a=result.count_a, count_b=result.count_b, s=opt.s) }}">下载完整示例名单 CSV</a>
+        </p>
+        {% if opt.list_a | length <= 200 and opt.list_b | length <= 200 %}
+        <table class="review-sample">
+          <tbody>
+            <tr><th>{{ review.names[0] }}（{{ opt.list_a | length }} 卷）</th>
+              <td>{{ opt.list_a | join('、') or '（空名单）' }}</td></tr>
+            <tr><th>{{ review.names[1] }}（{{ opt.list_b | length }} 卷）</th>
+              <td>{{ opt.list_b | join('、') or '（空名单）' }}</td></tr>
+          </tbody>
+        </table>
+        {% else %}
+        <p class="hint">{{ review.names[0] }} {{ opt.list_a | length }} 卷、{{ review.names[1] }}
+          {{ opt.list_b | length }} 卷，名单较长，请下载上方 CSV 查看完整卷号。</p>
+        {% endif %}
+        <p class="hint">按受理规则复算：入编 {{ opt.recomputed }} 卷
+          {% if opt.recomputed != opt.count %}<span class="flash error">（不一致）</span>{% endif %}</p>
+      </div>
+      {% endfor %}
+    {% endif %}
+  {% endif %}
+</section>
+{% endif %}
+
+<h3>卷号结论</h3>
 <table>
   <thead><tr><th>#</th><th>卷号</th><th>结论</th><th>可翻转结论的缺报名单</th></tr></thead>
   <tbody>

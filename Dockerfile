@@ -17,4 +17,5 @@ VOLUME ["/data"]
 EXPOSE 8000
 
 # 单 worker + 多线程：进程内重算锁可串行化所有写操作，SQLite 也最稳妥
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--threads", "4", "--timeout", "300", "app.wsgi:app"]
+# DEMO_SEED=1 时仅在空库写入演示数据，随后正常启动（补报/发版照常可用）
+CMD ["sh", "-c", "python -m app.demo_seed && exec gunicorn --bind 0.0.0.0:8000 --workers 1 --threads 4 --timeout 300 app.wsgi:app"]

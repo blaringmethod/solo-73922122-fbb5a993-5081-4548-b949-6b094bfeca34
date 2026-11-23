@@ -25,6 +25,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .logic import MAX_LISTS, RuleError, RuleEvaluator, parse_rule, referenced_names
+from .review import (ReviewError, build_math, collect_ref_names,
+                     count_inclusion_over, evaluate_two_lists,
+                     format_inclusion_formula, nearest_inclusion,
+                     sample_membership)
 
 MAX_VOLUMES = 50_000
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024  # 单次上传 8 MiB 上限
@@ -74,6 +78,7 @@ CREATE TABLE IF NOT EXISTS result_version (
     n_out       INTEGER NOT NULL,
     n_pending   INTEGER NOT NULL,
     n_missing_lists INTEGER NOT NULL,
+    missing_names_json TEXT NOT NULL DEFAULT '[]',
     rule_snapshot TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS result_item (
@@ -107,6 +112,11 @@ def init_db(path: str) -> None:
     conn = get_db(path)
     try:
         conn.executescript(SCHEMA)
+        # 兼容旧库：补齐结果版本上的缺报名单快照列
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(result_version)")}
+        if "missing_names_json" not in columns:
+            conn.execute("ALTER TABLE result_version "
+                         "ADD COLUMN missing_names_json TEXT NOT NULL DEFAULT '[]'")
         conn.commit()
     finally:
         conn.close()
@@ -391,9 +401,11 @@ class CatalogService:
 
         cur = conn.execute(
             "INSERT INTO result_version(created_at, reason, total, n_in, n_out, n_pending, "
-            "n_missing_lists, rule_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "n_missing_lists, missing_names_json, rule_snapshot) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (now_iso(), reason, len(volumes), counts["in"], counts["out"],
-             counts["pending"], len(missing_names), rule_text),
+             counts["pending"], len(missing_names),
+             json.dumps(missing_names, ensure_ascii=False), rule_text),
         )
         version_id = cur.lastrowid
         conn.executemany(
@@ -411,6 +423,172 @@ class CatalogService:
                 "n_pending": counts["pending"], "created": True}
 
     # ---- 结果查询与下载 -------------------------------------------------
+
+    def version_volumes(self, conn: sqlite3.Connection, version_id: int) -> list[str]:
+        """按受理版本内的原始卷序取出全部卷号（复核示例名单用）。"""
+        return [r["volume_no"] for r in conn.execute(
+            "SELECT volume_no FROM result_item WHERE version_id = ? ORDER BY rowid",
+            (version_id,))]
+
+    def review_page(self, conn: sqlite3.Connection, version_id: int,
+                    form: dict | None = None) -> dict:
+        """在结果页读取“受理版本”的快照并执行报数复核。
+
+        规则、缺报名单与卷序全部取自 version_id 对应版本，不读取当前名单状态；
+        受理后照常补报/发版不会改变这里的数据。返回模板所需的上下文。
+        """
+        version = self.get_version(conn, version_id)
+        if version is None:
+            raise ServiceError("版本不存在")
+
+        ctx = {
+            "version": version,
+            "eligible": False,
+            "reason": None,
+            "names": [],
+            "form": {"count_a": "", "count_b": "", "reported": "",
+                     "form_version": str(version_id)},
+            "result": None,
+            "error": None,
+        }
+
+        # 表单版号必须与受理版本一致；页面打开后若已发新版，先提示重开，不再继续复核。
+        submitted = dict(form) if form else None
+        if submitted is not None:
+            ctx["form"] = {
+                "count_a": submitted.get("count_a", ""),
+                "count_b": submitted.get("count_b", ""),
+                "reported": submitted.get("reported", ""),
+                "form_version": submitted.get("form_version", ""),
+            }
+            declared = str(submitted.get("version_id") or "").strip()
+            form_version = str(submitted.get("form_version") or "").strip()
+            if (declared and declared != str(version_id)) or \
+                    (form_version and form_version != str(version_id)):
+                shown = declared or form_version
+                ctx["error"] = (f"表单版号与现行版不符（表单 #{shown or '空'}，"
+                                f"现行 #{version_id}）。请重开结果页后再复核。")
+                return ctx
+
+        # 前提：总册非空；受理版本规则恰好引用两份名单，且当时两份均为缺报。
+        if version["total"] <= 0:
+            ctx["reason"] = "总册为空，无法复核。"
+            return ctx
+        missing = json.loads(version["missing_names_json"] or "[]")
+        try:
+            doc = json.loads(version["rule_snapshot"])
+        except json.JSONDecodeError:
+            ctx["reason"] = "受理版本的收录规则无法解析，无法复核。"
+            return ctx
+        refs = collect_ref_names(doc)
+
+        # 旧库升级前生成的版本没有名单快照；规则恰好引用两份、且当时缺报数也是 2，
+        # 说明这两份就是当时的缺报名单。名单次序无法还原，按名称排序展示。
+        if not missing and len(refs) == 2 and version["n_missing_lists"] == 2:
+            missing = sorted(refs)
+
+        if len(refs) != 2 or set(missing) != refs or len(set(missing)) != 2:
+            ctx["reason"] = (
+                "受理版本的收录规则需恰好引用两份名单，且这两份名单当时均为缺报；"
+                f"当前引用 {len(refs)} 份，其中缺报 {len(set(missing) & refs)} 份。"
+            )
+            return ctx
+
+        # 按受理版本登记顺序固定两份名单的展示次序与表单字段对应关系
+        names = list(missing)
+        ctx["names"] = names
+        ctx["eligible"] = True
+        try:
+            tree = parse_rule(doc, names)
+            table = evaluate_two_lists(tree, names)
+        except (RuleError, ReviewError) as exc:
+            ctx["reason"] = f"受理版本的收录规则无法复核：{exc}"
+            ctx["eligible"] = False
+            return ctx
+
+        if submitted is None:
+            return ctx
+        form = submitted
+
+        parsed: dict[str, int] = {}
+        for key, label in (("count_a", names[0]), ("count_b", names[1]),
+                           ("reported", "入编数")):
+            raw = str(form.get(key, "")).strip()
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                ctx["error"] = f"{label}必须填写整数。"
+                return ctx
+            if not 0 <= value <= version["total"]:
+                ctx["error"] = (f"{label}必须在 0 到总册卷数 {version['total']} 之间。")
+                return ctx
+            parsed[key] = value
+
+        try:
+            math = build_math(version["total"], parsed["count_a"],
+                              parsed["count_b"], table)
+            nearest = nearest_inclusion(math, parsed["reported"])
+            volumes = self.version_volumes(conn, version_id)
+            options = []
+            for item in nearest:
+                list_a, list_b = sample_membership(
+                    version["total"], parsed["count_a"], parsed["count_b"],
+                    item["s"], volumes)
+                recomputed = count_inclusion_over(table, volumes, list_a, list_b)
+                if recomputed != item["count"]:
+                    raise ReviewError(
+                        f"示例名单复算不一致（构造 {item['count']}，复算 {recomputed}）")
+                options.append({
+                    **item,
+                    "list_a": list_a,
+                    "list_b": list_b,
+                    "recomputed": recomputed,
+                })
+        except ReviewError as exc:
+            ctx["error"] = str(exc)
+            return ctx
+
+        ctx["result"] = {
+            "math": math,
+            "formula": format_inclusion_formula(math),
+            "options": options,
+            "reported": parsed["reported"],
+            "count_a": parsed["count_a"],
+            "count_b": parsed["count_b"],
+        }
+        return ctx
+
+    def review_sample_csv(self, version_id: int, count_a: int, count_b: int,
+                          intersection: int) -> str:
+        """下载复核示例名单：两列表的完整卷号，供 5 万卷规模下逐卷复算。"""
+        conn = self._conn()
+        try:
+            version = self.get_version(conn, version_id)
+            if version is None:
+                raise ServiceError("版本不存在")
+            volumes = self.version_volumes(conn, version_id)
+            try:
+                list_a, list_b = sample_membership(
+                    version["total"], count_a, count_b, intersection, volumes)
+            except ReviewError as exc:
+                raise ServiceError(str(exc)) from exc
+            try:
+                names = json.loads(version["missing_names_json"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                names = []
+            name_a = names[0] if len(names) > 0 else "名单A"
+            name_b = names[1] if len(names) > 1 else "名单B"
+            buf = io.StringIO()
+            buf.write("﻿")
+            writer = csv.writer(buf)
+            writer.writerow(["名单", "卷号"])
+            for volume in list_a:
+                writer.writerow([f"{name_a}（{count_a} 卷）", volume])
+            for volume in list_b:
+                writer.writerow([f"{name_b}（{count_b} 卷）", volume])
+            return buf.getvalue()
+        finally:
+            conn.close()
 
     def result_page(self, conn: sqlite3.Connection, version_id: int,
                     verdict: str | None, limit: int, offset: int) -> list[sqlite3.Row]:
